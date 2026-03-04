@@ -108,7 +108,17 @@ def _build_fts_join(alias: str, tag: str, left: bool = False) -> tuple[str, str]
         f"{join_type} tracks_fts {alias} "
         f"ON t.id = {alias}.track_id AND {alias}.semantic_tags MATCH ?"
     )
-    fts_param = f'semantic_tags:"{tag}"'
+    
+    # 複数のタグがスペース（全角・半角）区切りで送られてきた場合に OR検索 に自動変換
+    tags = [t.strip() for t in tag.replace("　", " ").split() if t.strip()]
+    if not tags:
+        fts_param = 'semantic_tags:""'
+    elif len(tags) == 1:
+        fts_param = f'semantic_tags:"{tags[0]}"'
+    else:
+        inner = " OR ".join(f'"{t}"' for t in tags)
+        fts_param = f'semantic_tags:({inner})'
+        
     return join_sql, fts_param
 
 
