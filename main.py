@@ -292,9 +292,10 @@ def search(
                 where_clauses.append("t.tempo <= ?")
                 params.append(bpm_max)
 
+        order_by = "ORDER BY f.rank LIMIT 3" if (tag and mood != "graduation") else "ORDER BY RANDOM() LIMIT 3"
         sql = _assemble_query(
             join_clauses, where_clauses,
-            extra="ORDER BY RANDOM() LIMIT 3",
+            extra=order_by,
         )
         cur.execute(sql, params)
         return _rows_to_dicts(cur.fetchall())
@@ -303,6 +304,23 @@ def search(
     results = _exec_search(use_bpm=True)
     if not results and (bpm_min is not None or bpm_max is not None):
         results = _exec_search(use_bpm=False)
+
+    # 0件に対するフォールバック処理 (絶対空振らないセーフティネット)
+    if not results:
+        fallback_params = []
+        if tag:
+            tags = [t.strip() for t in tag.replace("　", " ").replace(",", " ").split() if t.strip()]
+            if tags:
+                # 最初のタグだけで再検索
+                j, p = _build_fts_join("fb", tags[0])
+                sql = _assemble_query([j], [], extra="ORDER BY RANDOM() LIMIT 3")
+                cur.execute(sql, [p])
+                results = _rows_to_dicts(cur.fetchall())
+        
+        # それでも0件なら完全ランダム
+        if not results:
+            cur.execute("SELECT * FROM view_active_originals ORDER BY RANDOM() LIMIT 3")
+            results = _rows_to_dicts(cur.fetchall())
 
     return results
 
@@ -576,10 +594,31 @@ def concierge(
     # ---- 終了判定 (残り 20 件以下 or 5 ステップ到達) ----
     if remaining_count <= 20 or step >= 5:
         if remaining_count == 0:
-            return {"status": "finished", "remaining_count": 0, "songs": []}
+            # 0件に対するフォールバック処理
+            fallback_params = []
+            fallback_results = []
+            if tag:
+                tags = [t.strip() for t in tag.replace("　", " ").replace(",", " ").split() if t.strip()]
+                if tags:
+                    j, p = _build_fts_join("fb", tags[0])
+                    sql = _assemble_query([j], [], extra="ORDER BY RANDOM() LIMIT 3")
+                    cur.execute(sql, [p])
+                    fallback_results = _rows_to_dicts(cur.fetchall())
+            
+            if not fallback_results:
+                cur.execute("SELECT * FROM view_active_originals ORDER BY RANDOM() LIMIT 3")
+                fallback_results = _rows_to_dicts(cur.fetchall())
+
+            return {
+                "status": "finished",
+                "remaining_count": len(fallback_results),
+                "songs": fallback_results
+            }
+
+        order_by = "ORDER BY f.rank LIMIT 3" if (tag and mood != "graduation") else "ORDER BY RANDOM() LIMIT 3"
         sql = _assemble_query(
             effective_jc, effective_wc,
-            extra="ORDER BY RANDOM() LIMIT 3",
+            extra=order_by,
         )
         cur.execute(sql, effective_params)
         return {

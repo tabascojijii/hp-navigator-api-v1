@@ -1,9 +1,7 @@
-
-Testing FTS param: semantic_tags:("16ビート" OR "クール" OR "ロック" OR "ダンス" OR "赤羽橋ファンク" OR "EDM")
-Result: 580
-
-Testing FTS param: semantic_tags:"16ビート" OR semantic_tags:"クール" OR semantic_tags:"ロック" OR semantic_tags:"ダンス" OR semantic_tags:"赤羽橋ファンク" OR semantic_tags:"EDM"
-Result: 580
-
-Testing FTS param: "16ビート" OR "クール" OR "ロック" OR "ダンス" OR "赤羽橋ファンク" OR "EDM"
-Result: 580
+ヒット数: 580
+- 曲名: Teenage Solution
+  タグ: 強い女性, EDM, ダンス, クール, つんく＿おふざけ無し
+- 曲名: どーだっていいの
+  タグ: 16ビート, ロック, ダンス, クール, ライブ定番, 隠れ良曲, ディフィカルトリスニング初級
+- 曲名: FANTASY
+  タグ: 強い女性, 16ビート, ロック, ダンス, クール, セクシー, 良イントロ, 夜の曲, つんく♂がうるさい曲
