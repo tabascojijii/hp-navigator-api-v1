@@ -1,15 +1,22 @@
 """
-H!P-Navigator Backend API  v2.1.0
-SQLite3-native / FTS5-JOIN-powered / Akinator engine
-- pandas / numpy 依存なし
-- 起動時に meta_thresholds をキャッシュ
-- 全検索は view_active_originals ビュー対象
-- タグ検索は tracks_fts への JOIN で実行（サブクエリ不使用）
-- アキネーター次問選択はすべて SQL の GROUP BY / ABS で完結
+H!P-Navigator Backend API  v2.2.0
+SQLite3-native / FTS5-JOIN-powered / Tag-First Akinator engine
+
+変更概要 (v2.1 → v2.2):
+  - アキネーター: BPM質問を廃止。Era → is_tsunku → Tags → Artist の
+    優先順位で情報利得を計算。Tagsは使用済みタグ単位で除外し、
+    別タグへの質問は引き続き可能。
+  - コンシェルジュ: 既に絞り込み済みの属性を next_hints から除外。
+    タグ集計を最大500件に拡大し、指定済みタグ・mood・fame を除外した
+    未使用タグ上位5件を提示。
+  - 検索: BPM フィルタ適用後に 0件になる場合は BPM を緩和して再実行。
+  - 全般: bpm_bucket は answers から受け取っても WHERE に適用するが、
+    アキネーターの次問候補からは完全除外。
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any, Optional
@@ -20,21 +27,21 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 # 定数
 # ---------------------------------------------------------------------------
-# プロジェクト内の sqlite ファイル（相対パスで解決するか絶対パスで指定）
-import os
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(_HERE, "hp_akinator_prod.sqlite")
+
+# アキネーター: 序盤（Step≦EARLY_STEP）で era/is_tsunku を優先する閾値
+EARLY_STEP_THRESHOLD = 5
 
 # ---------------------------------------------------------------------------
 # グローバル状態
 # ---------------------------------------------------------------------------
 _con: sqlite3.Connection | None = None
-THRESHOLDS: dict[str, float] = {}          # score_name → threshold_value
+THRESHOLDS: dict[str, float] = {}   # score_name → threshold_value
 
 
 def _get_conn() -> sqlite3.Connection:
-    """スレッドセーフなコネクションを返す (WAL モード + check_same_thread=False)"""
+    """スレッドセーフなコネクションを返す (WAL + check_same_thread=False)"""
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
@@ -58,7 +65,6 @@ async def lifespan(app: FastAPI):
     THRESHOLDS = {row["score_name"]: row["threshold_value"] for row in cur.fetchall()}
     print(f"[startup] DB connected. Thresholds loaded: {len(THRESHOLDS)} entries.")
     yield
-    # シャットダウン時
     if _con:
         _con.close()
     print("[shutdown] DB connection closed.")
@@ -71,45 +77,74 @@ app = FastAPI(
     title="H!P-Navigator Backend API",
     description=(
         "SQLite3 / FTS5 powered search & Akinator engine "
-        "for Hello! Project songs (v2.1 – FTS5 JOIN edition)"
+        "for Hello! Project songs (v2.2 – Tag-First edition)"
     ),
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
 
 # ---------------------------------------------------------------------------
-# 共通ユーティリティ: FTS5 JOIN 節を生成
+# ユーティリティ: SQL ビルダー
 # ---------------------------------------------------------------------------
-def _fts_join_clause(tag: str) -> tuple[str, str]:
+
+def _build_fts_join(alias: str, tag: str, left: bool = False) -> tuple[str, str]:
     """
-    FTS5 タグ検索用の JOIN 節とパラメータを返す。
+    FTS5 JOIN 節を生成する。
+
+    Parameters
+    ----------
+    alias : str   SQL テーブルエイリアス（重複しないように呼び出し元で管理）
+    tag   : str   MATCH するタグ文字列
+    left  : bool  True なら LEFT JOIN（NOT MATCH 用途）
 
     Returns
     -------
-    join_sql   JOIN 節の SQL テキスト
-    fts_param  MATCH に渡す文字列
+    join_sql  : JOIN 節文字列
+    fts_param : MATCH に渡す文字列
     """
-    join_sql = "JOIN tracks_fts f ON t.id = f.track_id"
+    join_type = "LEFT JOIN" if left else "JOIN"
+    join_sql = (
+        f"{join_type} tracks_fts {alias} "
+        f"ON t.id = {alias}.track_id AND {alias}.semantic_tags MATCH ?"
+    )
     fts_param = f'semantic_tags:"{tag}"'
     return join_sql, fts_param
 
 
-def _graduation_clause_fts() -> tuple[str, str]:
-    """卒業曲特例: FTS5 JOIN で 'score_graduation > 0.7 OR タグ一致' を表現"""
-    # JOIN 側は OR 条件なので、FTS MATCH でタグを引き、UNIONするより
-    # score_graduation > 0.7 は WHERE 節に入れる
-    # ここでは JOIN を使いつつ LEFT JOIN で both を拾う
-    join_sql = "LEFT JOIN tracks_fts grad_f ON t.id = grad_f.track_id AND grad_f.semantic_tags MATCH '卒業曲'"
+def _graduation_join_where() -> tuple[str, str]:
+    """卒業曲特例: LEFT JOIN + (score > 0.7 OR タグ一致)"""
+    join_sql = (
+        "LEFT JOIN tracks_fts grad_f "
+        "ON t.id = grad_f.track_id AND grad_f.semantic_tags MATCH '卒業曲'"
+    )
     where_part = "(t.score_graduation > 0.7 OR grad_f.track_id IS NOT NULL)"
     return join_sql, where_part
+
+
+def _assemble_query(
+    join_clauses: list[str],
+    where_clauses: list[str],
+    select: str = "t.*",
+    extra: str = "",
+) -> str:
+    """JOIN / WHERE を結合して SELECT 文を生成する。"""
+    joins = "\n        ".join(join_clauses)
+    where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    return f"""
+        SELECT {select}
+        FROM view_active_originals t
+        {joins}
+        {where}
+        {extra}
+    """
 
 
 # ---------------------------------------------------------------------------
 # Pydantic モデル
 # ---------------------------------------------------------------------------
 class Answer(BaseModel):
-    attribute: str   # era | is_tsunku | artist_name | bpm_bucket | tags
+    attribute: str   # era | is_tsunku | artist_name | tags
     operator: str    # == | !=
     value: Any
 
@@ -120,7 +155,72 @@ class AkinatorRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# /search エンドポイント
+# 共通: answers → JOIN / WHERE 句の構築
+# ---------------------------------------------------------------------------
+def _build_from_answers(
+    answers: list[Answer],
+) -> tuple[list[str], list[str], list[Any]]:
+    """
+    アキネーターの answers リストから join_clauses / where_clauses / params を生成する。
+    bpm_bucket は受け取っても WHERE に適用する（ただしアキネーターは次問候補に出さない）。
+    """
+    join_clauses: list[str] = []
+    where_clauses: list[str] = []
+    params: list[Any] = []
+    fts_idx = 0
+
+    for ans in answers:
+        attr = ans.attribute
+        op   = ans.operator
+        val  = ans.value
+
+        if attr == "tags":
+            alias = f"af{fts_idx}"
+            fts_idx += 1
+            if op == "==":
+                j, p = _build_fts_join(alias, val, left=False)
+                join_clauses.append(j)
+                params.append(p)
+            elif op == "!=":
+                j, p = _build_fts_join(alias, val, left=True)
+                join_clauses.append(j)
+                params.append(p)
+                where_clauses.append(f"{alias}.track_id IS NULL")
+
+        elif attr == "era":
+            if op == "==":
+                where_clauses.append("t.era = ?")
+                params.append(val)
+            else:
+                where_clauses.append("t.era != ?")
+                params.append(val)
+
+        elif attr == "is_tsunku":
+            where_clauses.append("t.is_tsunku = ?")
+            params.append(1 if val else 0)
+
+        elif attr == "artist_name":
+            if op == "==":
+                where_clauses.append("t.artist_name = ?")
+                params.append(val)
+            else:
+                where_clauses.append("t.artist_name != ?")
+                params.append(val)
+
+        elif attr == "bpm_bucket":
+            # 明示的に answers に含まれた場合のみ適用（次問候補には出さない）
+            if op == "==":
+                where_clauses.append("t.bpm_bucket = ?")
+                params.append(val)
+            else:
+                where_clauses.append("t.bpm_bucket != ?")
+                params.append(val)
+
+    return join_clauses, where_clauses, params
+
+
+# ---------------------------------------------------------------------------
+# /search エンドポイント  ─ タグ優先 / BPM 軟着陸
 # ---------------------------------------------------------------------------
 @app.get("/search", summary="楽曲検索（FTS5 JOIN / スコア閾値フィルタ）")
 def search(
@@ -128,131 +228,80 @@ def search(
     tag:     Optional[str] = Query(None, description="セマンティックタグ（FTS5 MATCH）"),
     fame:    Optional[str] = Query(None, description="知名度 (standard | hidden | manic)"),
     mood:    Optional[str] = Query(None, description="感情スコアキー (euphoria, sentimental, … )"),
-    bpm_min: Optional[int] = Query(None, description="最小BPM (tempo)"),
-    bpm_max: Optional[int] = Query(None, description="最大BPM (tempo)"),
+    bpm_min: Optional[int] = Query(None, description="最小BPM (tempo) ※ソート補助として利用"),
+    bpm_max: Optional[int] = Query(None, description="最大BPM (tempo) ※ソート補助として利用"),
 ):
-    join_clauses: list[str] = []
-    where_clauses: list[str] = []
-    params: list[Any] = []
-
-    # ---- タグ検索 (FTS5 JOIN) ----
-    if tag and mood != "graduation":
-        join_sql, fts_param = _fts_join_clause(tag)
-        join_clauses.append(join_sql)
-        where_clauses.append("f.semantic_tags MATCH ?")
-        params.append(fts_param)
-
-    # ---- キーワード検索 (title / artist_name) ----
-    if q:
-        where_clauses.append("(t.title LIKE ? OR t.artist_name LIKE ?)")
-        wildcard = f"%{q}%"
-        params += [wildcard, wildcard]
-
-    # ---- 知名度フィルタ ----
-    if fame == "standard":
-        where_clauses.append("t.fame_score >= 0.3")
-    elif fame == "hidden":
-        where_clauses.append("t.fame_score >= 0.1 AND t.fame_score < 0.4")
-    elif fame == "manic":
-        where_clauses.append("t.fame_score < 0.1")
-
-    # ---- ムードフィルタ ----
-    if mood == "graduation":
-        grad_join, grad_where = _graduation_clause_fts()
-        join_clauses.append(grad_join)
-        where_clauses.append(grad_where)
-    elif mood:
-        score_col = f"score_{mood}"
-        if score_col in THRESHOLDS:
-            where_clauses.append(f"t.{score_col} >= ?")
-            params.append(THRESHOLDS[score_col])
-
-    # ---- BPM フィルタ ----
-    if bpm_min is not None:
-        where_clauses.append("t.tempo >= ?")
-        params.append(bpm_min)
-    if bpm_max is not None:
-        where_clauses.append("t.tempo <= ?")
-        params.append(bpm_max)
-
-    joins = "\n        ".join(join_clauses)
-    where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-
-    sql = f"""
-        SELECT t.*
-        FROM view_active_originals t
-        {joins}
-        {where}
-        ORDER BY RANDOM()
-        LIMIT 3
-    """
     cur = _con.cursor()
-    cur.execute(sql, params)
-    return _rows_to_dicts(cur.fetchall())
+
+    def _exec_search(use_bpm: bool) -> list[dict]:
+        join_clauses: list[str] = []
+        where_clauses: list[str] = []
+        params: list[Any] = []
+
+        # ---- タグ検索 (FTS5 JOIN) ---- 最優先
+        # JOIN 節に AND alias.semantic_tags MATCH ? を含むので WHERE 側は不要
+        if tag and mood != "graduation":
+            j, p = _build_fts_join("f", tag)
+            join_clauses.append(j)
+            params.append(p)
+
+        # ---- キーワード検索 ----
+        if q:
+            where_clauses.append("(t.title LIKE ? OR t.artist_name LIKE ?)")
+            wildcard = f"%{q}%"
+            params += [wildcard, wildcard]
+
+        # ---- 知名度フィルタ ----
+        if fame == "standard":
+            where_clauses.append("t.fame_score >= 0.3")
+        elif fame == "hidden":
+            where_clauses.append("t.fame_score >= 0.1 AND t.fame_score < 0.4")
+        elif fame == "manic":
+            where_clauses.append("t.fame_score < 0.1")
+
+        # ---- ムードフィルタ ----
+        if mood == "graduation":
+            grad_j, grad_w = _graduation_join_where()
+            join_clauses.append(grad_j)
+            where_clauses.append(grad_w)
+        elif mood:
+            score_col = f"score_{mood}"
+            if score_col in THRESHOLDS:
+                where_clauses.append(f"t.{score_col} >= ?")
+                params.append(THRESHOLDS[score_col])
+
+        # ---- BPM フィルタ（軟着陸: 0件なら呼び出し元でリトライ）----
+        if use_bpm:
+            if bpm_min is not None:
+                where_clauses.append("t.tempo >= ?")
+                params.append(bpm_min)
+            if bpm_max is not None:
+                where_clauses.append("t.tempo <= ?")
+                params.append(bpm_max)
+
+        sql = _assemble_query(
+            join_clauses, where_clauses,
+            extra="ORDER BY RANDOM() LIMIT 3",
+        )
+        cur.execute(sql, params)
+        return _rows_to_dicts(cur.fetchall())
+
+    # BPM あり → 0件なら BPM を外してリトライ（軟着陸）
+    results = _exec_search(use_bpm=True)
+    if not results and (bpm_min is not None or bpm_max is not None):
+        results = _exec_search(use_bpm=False)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
-# /akinator エンドポイント (SQL-only Akinator エンジン)
+# /akinator エンドポイント  ─ Tag-First 情報利得
 # ---------------------------------------------------------------------------
-@app.post("/akinator", summary="アキネーター（SQL情報利得による次問選択）")
+@app.post("/akinator", summary="アキネーター（Tag-First 情報利得による次問選択）")
 def run_akinator(request: AkinatorRequest):
-    # ---- Step 1: answers 履歴に基づく WHERE 句の構築 ----
-    join_clauses: list[str] = []
-    where_clauses: list[str] = []
-    params: list[Any] = []
 
-    fts_join_idx = 0
-    for ans in request.answers:
-        attr = ans.attribute
-        op   = ans.operator
-        val  = ans.value
-
-        if attr == "tags":
-            alias = f"af{fts_join_idx}"
-            fts_join_idx += 1
-            fts_param = f'semantic_tags:"{val}"'
-            if op == "==":
-                join_clauses.append(
-                    f"JOIN tracks_fts {alias} ON t.id = {alias}.track_id"
-                    f" AND {alias}.semantic_tags MATCH ?"
-                )
-                params.append(fts_param)
-            elif op == "!=":
-                # NOT MATCH は FTS5 が直接非対応のため LEFT JOIN + IS NULL で表現
-                join_clauses.append(
-                    f"LEFT JOIN tracks_fts {alias} ON t.id = {alias}.track_id"
-                    f" AND {alias}.semantic_tags MATCH ?"
-                )
-                params.append(fts_param)
-                where_clauses.append(f"{alias}.track_id IS NULL")
-
-        elif attr == "artist_name":
-            if op == "==":
-                where_clauses.append("t.artist_name = ?")
-                params.append(val)
-            elif op == "!=":
-                where_clauses.append("t.artist_name != ?")
-                params.append(val)
-
-        elif attr == "era":
-            if op == "==":
-                where_clauses.append("t.era = ?")
-                params.append(val)
-            elif op == "!=":
-                where_clauses.append("t.era != ?")
-                params.append(val)
-
-        elif attr == "bpm_bucket":
-            if op == "==":
-                where_clauses.append("t.bpm_bucket = ?")
-                params.append(val)
-            elif op == "!=":
-                where_clauses.append("t.bpm_bucket != ?")
-                params.append(val)
-
-        elif attr == "is_tsunku":
-            where_clauses.append("t.is_tsunku = ?")
-            params.append(1 if val else 0)
+    # ---- Step 1: answers から WHERE 構築 ----
+    join_clauses, where_clauses, params = _build_from_answers(request.answers)
 
     joins = "\n        ".join(join_clauses)
     where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
@@ -270,35 +319,42 @@ def run_akinator(request: AkinatorRequest):
     if remaining_count <= 3 or request.step >= 15:
         if remaining_count == 0:
             return {"status": "finished", "remaining_count": 0, "songs": []}
-        cur.execute(
-            f"SELECT t.* FROM view_active_originals t {joins} {where} ORDER BY RANDOM() LIMIT 3",
-            params,
+        sql = _assemble_query(
+            join_clauses, where_clauses,
+            extra="ORDER BY RANDOM() LIMIT 3",
         )
+        cur.execute(sql, params)
         return {
             "status": "finished",
             "remaining_count": remaining_count,
             "songs": _rows_to_dicts(cur.fetchall()),
         }
 
-    # ---- Step 4: 次問の選定 (SQL で情報利得計算) ----
+    # ---- Step 4: 次問選定 ─ 優先順位: era > is_tsunku > tags > artist_name ----
+    # BPM (bpm_bucket) は候補から完全除外。
+    # used_attrs は属性名単位で既使用を管理。
+    # tags は「使用済みタグ値」単位で管理し、別タグへの質問は許可する。
     used_attrs = {ans.attribute for ans in request.answers}
+    used_tags  = {ans.value for ans in request.answers if ans.attribute == "tags"}
 
     best_diff = float("inf")
     best_question: dict | None = None
 
-    def _check(diff: float, question: dict) -> None:
+    def _update_best(diff: float, question: dict) -> None:
         nonlocal best_diff, best_question
         if diff < best_diff:
             best_diff = diff
             best_question = question
 
-    # 候補 A: era
+    # ------------------------------------------------------------------
+    # 候補 A: era  ─ データ充填率 100%、序盤の主力
+    # ------------------------------------------------------------------
     if "era" not in used_attrs:
         cur.execute(
             f"""
-            SELECT era, COUNT(*) as cnt
+            SELECT t.era, COUNT(*) AS cnt
             FROM view_active_originals t {joins} {where}
-            GROUP BY era
+            GROUP BY t.era
             ORDER BY ABS(CAST(COUNT(*) AS REAL) / {remaining_count} - 0.5)
             LIMIT 1
             """,
@@ -307,31 +363,72 @@ def run_akinator(request: AkinatorRequest):
         row = cur.fetchone()
         if row and row["cnt"] > 0:
             diff = abs(row["cnt"] / remaining_count - 0.5)
-            _check(diff, {"attribute": "era", "operator": "==", "value": row["era"]})
+            _update_best(diff, {"attribute": "era", "operator": "==", "value": row["era"]})
 
-    # 候補 B: is_tsunku
+    # ------------------------------------------------------------------
+    # 候補 B: is_tsunku  ─ データ充填率 100%、序盤の主力
+    # ------------------------------------------------------------------
     if "is_tsunku" not in used_attrs:
         cur.execute(
-            f"SELECT SUM(t.is_tsunku) as cnt_1 FROM view_active_originals t {joins} {where}",
+            f"""
+            SELECT SUM(t.is_tsunku) AS cnt_1
+            FROM view_active_originals t {joins} {where}
+            """,
             params,
         )
         row = cur.fetchone()
         if row and row["cnt_1"] is not None:
-            diff = abs(row["cnt_1"] / remaining_count - 0.5)
-            _check(diff, {"attribute": "is_tsunku", "operator": "==", "value": True})
+            diff = abs(int(row["cnt_1"]) / remaining_count - 0.5)
+            _update_best(
+                diff,
+                {"attribute": "is_tsunku", "operator": "==", "value": True},
+            )
 
-    # 候補 C: artist_name（最も 50% 分割に近いアーティスト）
+    # ------------------------------------------------------------------
+    # 候補 C: semantic_tags  ─ 中盤以降の主力
+    # 使用済みタグ値（used_tags）を除いた最も 50% 分割に近いタグを探す。
+    # FTS5 は GROUP BY 集計が困難なため Python 側で計算する。
+    # ------------------------------------------------------------------
+    cur.execute(
+        f"""
+        SELECT t.semantic_tags
+        FROM view_active_originals t {joins} {where}
+        """,
+        params,
+    )
+    tag_counts: dict[str, int] = {}
+    for row in cur.fetchall():
+        raw = row["semantic_tags"] or ""
+        for tg in (x.strip() for x in raw.split(",") if x.strip()):
+            if tg not in used_tags:
+                tag_counts[tg] = tag_counts.get(tg, 0) + 1
+
+    if tag_counts:
+        best_tag = min(
+            tag_counts,
+            key=lambda tg: abs(tag_counts[tg] / remaining_count - 0.5),
+        )
+        diff = abs(tag_counts[best_tag] / remaining_count - 0.5)
+        _update_best(
+            diff,
+            {"attribute": "tags", "operator": "==", "value": best_tag},
+        )
+
+    # ------------------------------------------------------------------
+    # 候補 D: artist_name  ─ 終盤用（候補が特定アーティストに集中したとき）
+    # ------------------------------------------------------------------
     if "artist_name" not in used_attrs:
         used_artists = [a.value for a in request.answers if a.attribute == "artist_name"]
         ex_params = list(params)
         exclude_sql = ""
         if used_artists:
-            placeholders = ",".join("?" * len(used_artists))
-            exclude_sql = f"AND t.artist_name NOT IN ({placeholders})"
+            ph = ",".join("?" * len(used_artists))
+            exclude_sql = f"AND t.artist_name NOT IN ({ph})"
             ex_params += used_artists
+
         cur.execute(
             f"""
-            SELECT t.artist_name, COUNT(*) as cnt
+            SELECT t.artist_name, COUNT(*) AS cnt
             FROM view_active_originals t {joins}
             {where}
             {exclude_sql}
@@ -344,54 +441,17 @@ def run_akinator(request: AkinatorRequest):
         row = cur.fetchone()
         if row and row["cnt"] > 0:
             diff = abs(row["cnt"] / remaining_count - 0.5)
-            _check(diff, {"attribute": "artist_name", "operator": "==", "value": row["artist_name"]})
+            _update_best(
+                diff,
+                {"attribute": "artist_name", "operator": "==", "value": row["artist_name"]},
+            )
 
-    # 候補 D: bpm_bucket（最も 50% 分割に近いバケット）
-    if "bpm_bucket" not in used_attrs:
-        cur.execute(
-            f"""
-            SELECT t.bpm_bucket, COUNT(*) as cnt
-            FROM view_active_originals t {joins} {where}
-            GROUP BY t.bpm_bucket
-            ORDER BY ABS(CAST(COUNT(*) AS REAL) / {remaining_count} - 0.5)
-            LIMIT 1
-            """,
-            params,
-        )
-        row = cur.fetchone()
-        if row and row["cnt"] > 0:
-            diff = abs(row["cnt"] / remaining_count - 0.5)
-            _check(diff, {"attribute": "bpm_bucket", "operator": "==", "value": row["bpm_bucket"]})
-
-    # 候補 E: tags（FTS5 候補タグを SQL で頻度集計 → Python 側で 50% 近似）
-    # ※ FTS5 は GROUP BY 集計が困難なため、semantic_tags カラムを取得して Python 集計
-    if "tags" not in used_attrs:
-        used_tags = {a.value for a in request.answers if a.attribute == "tags"}
-        cur.execute(
-            f"""
-            SELECT t.semantic_tags
-            FROM view_active_originals t {joins} {where}
-            """,
-            params,
-        )
-        tag_counts: dict[str, int] = {}
-        for row in cur.fetchall():
-            raw = row["semantic_tags"] or ""
-            for t in (x.strip() for x in raw.split(",") if x.strip()):
-                if t not in used_tags:
-                    tag_counts[t] = tag_counts.get(t, 0) + 1
-
-        if tag_counts:
-            best_tag = min(tag_counts, key=lambda t: abs(tag_counts[t] / remaining_count - 0.5))
-            diff = abs(tag_counts[best_tag] / remaining_count - 0.5)
-            _check(diff, {"attribute": "tags", "operator": "==", "value": best_tag})
-
-    # フォールバック: 何も選べなければ最初の候補を直接返す
+    # ------------------------------------------------------------------
+    # フォールバック: 候補が何もなければ最初の曲名を返す
+    # ------------------------------------------------------------------
     if not best_question:
-        cur.execute(
-            f"SELECT t.title FROM view_active_originals t {joins} {where} LIMIT 1",
-            params,
-        )
+        sql = _assemble_query(join_clauses, where_clauses, select="t.title", extra="LIMIT 1")
+        cur.execute(sql, params)
         row = cur.fetchone()
         best_question = {
             "attribute": "title",
@@ -407,7 +467,7 @@ def run_akinator(request: AkinatorRequest):
 
 
 # ---------------------------------------------------------------------------
-# /concierge エンドポイント (ガイド付き検索)
+# /concierge エンドポイント  ─ 重複質問防止 / 動的タグ抽出
 # ---------------------------------------------------------------------------
 @app.get("/concierge", summary="コンシェルジュ（段階的絞り込みガイド）")
 def concierge(
@@ -424,11 +484,11 @@ def concierge(
     params: list[Any] = []
 
     # ---- タグ検索 (FTS5 JOIN) ----
+    # JOIN 節に AND alias.semantic_tags MATCH ? を含むので WHERE 側は不要
     if tag and mood != "graduation":
-        join_sql, fts_param = _fts_join_clause(tag)
-        join_clauses.append(join_sql)
-        where_clauses.append("f.semantic_tags MATCH ?")
-        params.append(fts_param)
+        j, p = _build_fts_join("f", tag)
+        join_clauses.append(j)
+        params.append(p)
 
     # ---- キーワード検索 ----
     if q:
@@ -446,69 +506,110 @@ def concierge(
 
     # ---- ムードフィルタ ----
     if mood == "graduation":
-        grad_join, grad_where = _graduation_clause_fts()
-        join_clauses.append(grad_join)
-        where_clauses.append(grad_where)
+        grad_j, grad_w = _graduation_join_where()
+        join_clauses.append(grad_j)
+        where_clauses.append(grad_w)
     elif mood:
         score_col = f"score_{mood}"
         if score_col in THRESHOLDS:
             where_clauses.append(f"t.{score_col} >= ?")
             params.append(THRESHOLDS[score_col])
 
-    # ---- BPM フィルタ ----
-    if bpm_min is not None:
-        where_clauses.append("t.tempo >= ?")
-        params.append(bpm_min)
-    if bpm_max is not None:
-        where_clauses.append("t.tempo <= ?")
-        params.append(bpm_max)
+    # ---- BPM フィルタ（軟着陸付き）----
+    bpm_requested = bpm_min is not None or bpm_max is not None
 
-    joins = "\n        ".join(join_clauses)
-    where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    def _base_query_with_bpm(use_bpm: bool) -> tuple[list[str], list[str], list[Any]]:
+        """BPM の有無だけ違うクローンを作る"""
+        wc = list(where_clauses)
+        pr = list(params)
+        if use_bpm:
+            if bpm_min is not None:
+                wc.append("t.tempo >= ?")
+                pr.append(bpm_min)
+            if bpm_max is not None:
+                wc.append("t.tempo <= ?")
+                pr.append(bpm_max)
+        return list(join_clauses), wc, pr
+
     cur = _con.cursor()
 
-    # 残件数
+    # BPM 込みで件数確認
+    jc_bpm, wc_bpm, pr_bpm = _base_query_with_bpm(use_bpm=bpm_requested)
+    joins_bpm = "\n        ".join(jc_bpm)
+    where_bpm = ("WHERE " + " AND ".join(wc_bpm)) if wc_bpm else ""
+
     cur.execute(
-        f"SELECT COUNT(*) FROM view_active_originals t {joins} {where}",
-        params,
+        f"SELECT COUNT(*) FROM view_active_originals t {joins_bpm} {where_bpm}",
+        pr_bpm,
     )
     remaining_count: int = cur.fetchone()[0]
 
-    # 終了判定 (残り 20 件以下 or 5 ステップ到達)
+    # 軟着陸: BPM あり → 0件 → BPM なしで再カウント
+    effective_jc, effective_wc, effective_params = jc_bpm, wc_bpm, pr_bpm
+    if remaining_count == 0 and bpm_requested:
+        jc_nb, wc_nb, pr_nb = _base_query_with_bpm(use_bpm=False)
+        joins_nb = "\n        ".join(jc_nb)
+        where_nb = ("WHERE " + " AND ".join(wc_nb)) if wc_nb else ""
+        cur.execute(
+            f"SELECT COUNT(*) FROM view_active_originals t {joins_nb} {where_nb}",
+            pr_nb,
+        )
+        remaining_count = cur.fetchone()[0]
+        effective_jc, effective_wc, effective_params = jc_nb, wc_nb, pr_nb
+
+    effective_joins = "\n        ".join(effective_jc)
+    effective_where = ("WHERE " + " AND ".join(effective_wc)) if effective_wc else ""
+
+    # ---- 終了判定 (残り 20 件以下 or 5 ステップ到達) ----
     if remaining_count <= 20 or step >= 5:
         if remaining_count == 0:
             return {"status": "finished", "remaining_count": 0, "songs": []}
-        cur.execute(
-            f"SELECT t.* FROM view_active_originals t {joins} {where} ORDER BY RANDOM() LIMIT 3",
-            params,
+        sql = _assemble_query(
+            effective_jc, effective_wc,
+            extra="ORDER BY RANDOM() LIMIT 3",
         )
+        cur.execute(sql, effective_params)
         return {
             "status": "finished",
             "remaining_count": remaining_count,
             "songs": _rows_to_dicts(cur.fetchall()),
         }
 
-    # ヒント生成: 頻出タグを集計して提示
+    # ---- ヒント生成: 既使用属性を除外した上位タグ動的抽出 ----
+    # 既に絞り込みに使われている属性を「使用済み」として記録
+    already_used_tags: set[str] = set()
+    if tag:
+        already_used_tags.add(tag.lower())
+
+    # mood や fame が指定されている場合、それ系のヒントは出さない
+    # → semantic_tags の中から「まだ指定していないタグ」の上位5件を提示
+
     cur.execute(
         f"""
         SELECT t.semantic_tags
-        FROM view_active_originals t {joins} {where}
-        LIMIT 200
+        FROM view_active_originals t {effective_joins} {effective_where}
+        LIMIT 500
         """,
-        params,
+        effective_params,
     )
-    tag_counts: dict[str, int] = {}
+    tag_freq: dict[str, int] = {}
     for row in cur.fetchall():
         raw = row["semantic_tags"] or ""
         for tg in (x.strip() for x in raw.split(",") if x.strip()):
-            if not tag or tg.lower() != tag.lower():
-                tag_counts[tg] = tag_counts.get(tg, 0) + 1
+            # 既に絞り込みで使用済みのタグ（大文字小文字無視）を除外
+            if tg.lower() not in already_used_tags:
+                tag_freq[tg] = tag_freq.get(tg, 0) + 1
 
-    if tag_counts:
-        top_tags = sorted(tag_counts, key=tag_counts.__getitem__, reverse=True)[:3]
+    if tag_freq:
+        top_tags = sorted(tag_freq, key=tag_freq.__getitem__, reverse=True)[:5]
         hint = {"attribute": "tag", "options": top_tags}
     else:
-        hint = {"attribute": "mood", "options": ["euphoria", "sentimental", "struggle"]}
+        # タグが尽きた場合は mood/fame を提案（ただし既に使用済みなら除く）
+        fallback_moods = [
+            m for m in ["euphoria", "sentimental", "struggle", "energy_burst"]
+            if m != mood
+        ]
+        hint = {"attribute": "mood", "options": fallback_moods[:3]}
 
     return {
         "status": "questioning",
@@ -523,7 +624,7 @@ def concierge(
 @app.get("/health", summary="ヘルスチェック", include_in_schema=False)
 def health():
     cur = _con.cursor()
-    cur.execute("SELECT COUNT(*) as cnt FROM view_active_originals")
+    cur.execute("SELECT COUNT(*) AS cnt FROM view_active_originals")
     cnt = cur.fetchone()["cnt"]
     return {
         "status": "ok",
