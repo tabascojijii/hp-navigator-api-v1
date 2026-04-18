@@ -16,19 +16,28 @@ SQLite3-native / FTS5-JOIN-powered / Tag-First Akinator engine
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
+import time
+import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from ipaddress import ip_address, ip_network
 from typing import Any, Optional
 
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
+from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # 定数
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(_HERE, "hp_akinator_prod.sqlite")
+MAX_Q_LENGTH = 200
 
 # アキネーター: 序盤（Step≦EARLY_STEP）で era/is_tsunku を優先する閾値
 EARLY_STEP_THRESHOLD = 5
@@ -38,6 +47,200 @@ EARLY_STEP_THRESHOLD = 5
 # ---------------------------------------------------------------------------
 _con: sqlite3.Connection | None = None
 THRESHOLDS: dict[str, float] = {}   # score_name → threshold_value
+
+
+@dataclass
+class SecurityConfig:
+    api_keys: set[str]
+    allowed_ip_networks: list[Any]
+    health_allowed_ip_networks: list[Any]
+    trusted_proxy_networks: list[Any]
+
+
+SECURITY_CONFIG: SecurityConfig | None = None
+
+
+def _split_csv_env(name: str) -> list[str]:
+    raw = os.getenv(name, "")
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _parse_cidr_list(name: str, required: bool) -> list[Any]:
+    items = _split_csv_env(name)
+    if required and not items:
+        raise RuntimeError(f"{name} is required and must not be empty.")
+    networks: list[Any] = []
+    for token in items:
+        try:
+            networks.append(ip_network(token, strict=False))
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid CIDR in {name}: {token}") from exc
+    return networks
+
+
+def _load_security_config() -> SecurityConfig:
+    api_keys = set(_split_csv_env("HP_API_KEYS"))
+    if not api_keys:
+        raise RuntimeError("HP_API_KEYS is required and must not be empty.")
+
+    allowed = _parse_cidr_list("HP_SECURITY_ALLOWED_IPS", required=True)
+    health_allowed = _parse_cidr_list("HP_HEALTH_ALLOWED_IPS", required=True)
+    trusted = _parse_cidr_list("HP_SECURITY_TRUSTED_PROXY_CIDRS", required=False)
+    return SecurityConfig(
+        api_keys=api_keys,
+        allowed_ip_networks=allowed,
+        health_allowed_ip_networks=health_allowed,
+        trusted_proxy_networks=trusted,
+    )
+
+
+def _is_visible_ascii(value: str) -> bool:
+    if not (1 <= len(value) <= 128):
+        return False
+    return all(33 <= ord(ch) <= 126 for ch in value)
+
+
+def _resolve_request_id(request: Request) -> str:
+    incoming = request.headers.get("X-Request-Id", "")
+    if incoming and _is_visible_ascii(incoming):
+        return incoming
+    return f"req_{uuid.uuid4().hex}"
+
+
+def _masked_api_key_id(api_key: str | None) -> str:
+    if not api_key:
+        return "none"
+    return f"key_****{api_key[-4:]}"
+
+
+def _build_error_payload(
+    *,
+    code: str,
+    message: str,
+    request_id: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": request_id,
+        }
+    }
+    if details:
+        payload["error"]["details"] = details
+    return payload
+
+
+def _error_response(
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+    request_id: str,
+    details: dict[str, Any] | None = None,
+) -> JSONResponse:
+    payload = _build_error_payload(
+        code=code,
+        message=message,
+        request_id=request_id,
+        details=details,
+    )
+    response = JSONResponse(status_code=status_code, content=payload)
+    response.headers["X-Request-Id"] = request_id
+    return response
+
+
+def _validation_error_response(
+    *,
+    request_id: str,
+    source: str,
+    field: str,
+    reason: str,
+    status_code: int = 422,
+) -> JSONResponse:
+    return _error_response(
+        status_code=status_code,
+        code="VALIDATION_ERROR",
+        message="Request validation failed.",
+        request_id=request_id,
+        details={"source": source, "field": field, "reason": reason},
+    )
+
+
+def _ip_allowed(ip_str: str, networks: list[Any]) -> bool:
+    ip_obj = ip_address(ip_str)
+    return any(ip_obj in net for net in networks)
+
+
+def _resolve_client_ip(
+    request: Request,
+    cfg: SecurityConfig,
+    request_id: str,
+) -> tuple[Optional[str], Optional[JSONResponse]]:
+    raw_remote = request.client.host if request.client else ""
+    try:
+        remote_ip = ip_address(raw_remote)
+    except ValueError:
+        return None, _error_response(
+            status_code=400,
+            code="VALIDATION_ERROR",
+            message="Invalid client remote address.",
+            request_id=request_id,
+            details={"source": "header", "field": "remote_addr", "reason": "invalid ip format"},
+        )
+
+    is_trusted_proxy = any(remote_ip in net for net in cfg.trusted_proxy_networks)
+    if is_trusted_proxy:
+        xff = request.headers.get("X-Forwarded-For", "").strip()
+        if not xff:
+            return None, _error_response(
+                status_code=400,
+                code="VALIDATION_ERROR",
+                message="Invalid X-Forwarded-For header.",
+                request_id=request_id,
+                details={"source": "header", "field": "X-Forwarded-For", "reason": "empty"},
+            )
+        leftmost = xff.split(",")[0].strip()
+        try:
+            ip_address(leftmost)
+        except ValueError:
+            return None, _error_response(
+                status_code=400,
+                code="VALIDATION_ERROR",
+                message="Invalid X-Forwarded-For header.",
+                request_id=request_id,
+                details={"source": "header", "field": "X-Forwarded-For", "reason": "invalid ip format"},
+            )
+        return leftmost, None
+
+    return str(remote_ip), None
+
+
+def _audit_log(
+    *,
+    request_id: str,
+    endpoint: str,
+    method: str,
+    status: int,
+    client_ip: str,
+    auth_result: str,
+    api_key_masked: str,
+    reason: str,
+    latency_ms: float,
+) -> None:
+    payload = {
+        "request_id": request_id,
+        "endpoint": endpoint,
+        "method": method,
+        "status": status,
+        "client_ip": client_ip,
+        "auth_result": auth_result,
+        "api_key_id(masked)": api_key_masked,
+        "reason": reason,
+        "latency_ms": round(latency_ms, 3),
+    }
+    print("[audit] " + json.dumps(payload, ensure_ascii=False))
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -58,7 +261,8 @@ def _rows_to_dicts(rows) -> list[dict]:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _con, THRESHOLDS
+    global _con, THRESHOLDS, SECURITY_CONFIG
+    SECURITY_CONFIG = _load_security_config()
     _con = _get_conn()
     cur = _con.cursor()
     cur.execute("SELECT score_name, threshold_value FROM meta_thresholds")
@@ -82,6 +286,152 @@ app = FastAPI(
     version="2.2.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    request_id = getattr(request.state, "request_id", _resolve_request_id(request))
+    source = "body"
+    field = "unknown"
+    reason = "validation failed"
+    if exc.errors():
+        loc = exc.errors()[0].get("loc", [])
+        if len(loc) >= 2 and loc[0] in {"query", "body", "header"}:
+            source = str(loc[0])
+            field = str(loc[1])
+        elif len(loc) >= 1 and loc[0] in {"query", "body", "header"}:
+            source = str(loc[0])
+        reason = str(exc.errors()[0].get("msg", reason))
+    return _validation_error_response(
+        request_id=request_id,
+        source=source,
+        field=field,
+        reason=reason,
+        status_code=422,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = getattr(request.state, "request_id", _resolve_request_id(request))
+    return _error_response(
+        status_code=500,
+        code="INTERNAL_ERROR",
+        message="An unexpected error occurred.",
+        request_id=request_id,
+    )
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    # FastAPI docs endpoints are not part of this API contract.
+    if request.url.path in {"/docs", "/redoc", "/openapi.json"}:
+        return await call_next(request)
+
+    request_id = _resolve_request_id(request)
+    request.state.request_id = request_id
+    start = time.perf_counter()
+    raw_remote = request.client.host if request.client else "unknown"
+    api_key = request.headers.get("X-API-Key")
+    api_key_masked = _masked_api_key_id(api_key)
+
+    def _respond_and_log(
+        response: JSONResponse,
+        *,
+        client_ip: str,
+        auth_result: str,
+        reason: str,
+    ) -> JSONResponse:
+        latency_ms = (time.perf_counter() - start) * 1000
+        _audit_log(
+            request_id=request_id,
+            endpoint=request.url.path,
+            method=request.method,
+            status=response.status_code,
+            client_ip=client_ip,
+            auth_result=auth_result,
+            api_key_masked=api_key_masked,
+            reason=reason,
+            latency_ms=latency_ms,
+        )
+        return response
+
+    cfg = SECURITY_CONFIG
+    if cfg is None:
+        return _respond_and_log(
+            _error_response(
+                status_code=500,
+                code="INTERNAL_ERROR",
+                message="Security configuration is not loaded.",
+                request_id=request_id,
+            ),
+            client_ip=raw_remote,
+            auth_result="config_error",
+            reason="security_config_not_loaded",
+        )
+
+    # 1) API Key
+    if not api_key or api_key not in cfg.api_keys:
+        return _respond_and_log(
+            _error_response(
+                status_code=401,
+                code="UNAUTHORIZED",
+                message="API key is missing or invalid.",
+                request_id=request_id,
+                details={"source": "header", "field": "X-API-Key", "reason": "missing_or_invalid"},
+            ),
+            client_ip=raw_remote,
+            auth_result="deny_api_key",
+            reason="missing_or_invalid_api_key",
+        )
+
+    # 2) Resolve client IP
+    client_ip, ip_error = _resolve_client_ip(request, cfg, request_id)
+    if ip_error is not None:
+        return _respond_and_log(
+            ip_error,
+            client_ip=raw_remote,
+            auth_result="deny_invalid_ip_header",
+            reason="invalid_client_ip_or_xff",
+        )
+    assert client_ip is not None
+
+    # 3) Allowlist
+    allowlist = cfg.health_allowed_ip_networks if request.url.path == "/health" else cfg.allowed_ip_networks
+    if not _ip_allowed(client_ip, allowlist):
+        return _respond_and_log(
+            _error_response(
+                status_code=403,
+                code="FORBIDDEN",
+                message="Client IP is not allowed.",
+                request_id=request_id,
+                details={"source": "header", "field": "client_ip", "reason": "not_allowed", "client_ip": client_ip},
+            ),
+            client_ip=client_ip,
+            auth_result="deny_ip",
+            reason="ip_not_allowed",
+        )
+
+    request.state.client_ip = client_ip
+    request.state.api_key_masked = api_key_masked
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        response = _error_response(
+            status_code=500,
+            code="INTERNAL_ERROR",
+            message="An unexpected error occurred.",
+            request_id=request_id,
+        )
+
+    response.headers["X-Request-Id"] = request_id
+    return _respond_and_log(
+        response,
+        client_ip=client_ip,
+        auth_result="ok",
+        reason="ok",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +514,7 @@ class Answer(BaseModel):
 
 class AkinatorRequest(BaseModel):
     answers: list[Answer] = []
-    step: int = 1
+    step: int = Field(1, ge=1)
 
 
 # ---------------------------------------------------------------------------
@@ -237,13 +587,30 @@ def _build_from_answers(
 # ---------------------------------------------------------------------------
 @app.get("/search", summary="楽曲検索（FTS5 JOIN / スコア閾値フィルタ）")
 def search(
-    q:       Optional[str] = Query(None, description="キーワード（曲名・アーティスト名）"),
+    request: Request,
+    q:       Optional[str] = Query(None, max_length=MAX_Q_LENGTH, description="キーワード（曲名・アーティスト名）"),
     tag:     Optional[str] = Query(None, description="セマンティックタグ（FTS5 MATCH）"),
     fame:    Optional[str] = Query(None, description="知名度 (standard | hidden | manic)"),
     mood:    Optional[str] = Query(None, description="感情スコアキー (euphoria, sentimental, … )"),
     bpm_min: Optional[int] = Query(None, description="最小BPM (tempo) ※ソート補助として利用"),
     bpm_max: Optional[int] = Query(None, description="最大BPM (tempo) ※ソート補助として利用"),
 ):
+    request_id = getattr(request.state, "request_id", "req_unknown")
+    if _con is None:
+        return _error_response(
+            status_code=500,
+            code="INTERNAL_ERROR",
+            message="Database connection is not ready.",
+            request_id=request_id,
+        )
+    if bpm_min is not None and bpm_max is not None and bpm_min > bpm_max:
+        return _validation_error_response(
+            request_id=request_id,
+            source="query",
+            field="bpm_min",
+            reason="must be less than or equal to bpm_max",
+            status_code=422,
+        )
     cur = _con.cursor()
 
     def _exec_search(use_bpm: bool) -> list[dict]:
@@ -329,10 +696,18 @@ def search(
 # /akinator エンドポイント  ─ Tag-First 情報利得
 # ---------------------------------------------------------------------------
 @app.post("/akinator", summary="アキネーター（Tag-First 情報利得による次問選択）")
-def run_akinator(request: AkinatorRequest):
+def run_akinator(payload: AkinatorRequest, request: Request):
+    request_id = getattr(request.state, "request_id", "req_unknown")
+    if _con is None:
+        return _error_response(
+            status_code=500,
+            code="INTERNAL_ERROR",
+            message="Database connection is not ready.",
+            request_id=request_id,
+        )
 
     # ---- Step 1: answers から WHERE 構築 ----
-    join_clauses, where_clauses, params = _build_from_answers(request.answers)
+    join_clauses, where_clauses, params = _build_from_answers(payload.answers)
 
     joins = "\n        ".join(join_clauses)
     where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
@@ -347,7 +722,7 @@ def run_akinator(request: AkinatorRequest):
     remaining_count: int = cur.fetchone()[0]
 
     # ---- Step 3: 終了判定 ----
-    if remaining_count <= 3 or request.step >= 15:
+    if remaining_count <= 3 or payload.step >= 15:
         if remaining_count == 0:
             return {"status": "finished", "remaining_count": 0, "songs": []}
         sql = _assemble_query(
@@ -365,8 +740,8 @@ def run_akinator(request: AkinatorRequest):
     # BPM (bpm_bucket) は候補から完全除外。
     # used_attrs は属性名単位で既使用を管理。
     # tags は「使用済みタグ値」単位で管理し、別タグへの質問は許可する。
-    used_attrs = {ans.attribute for ans in request.answers}
-    used_tags  = {ans.value for ans in request.answers if ans.attribute == "tags"}
+    used_attrs = {ans.attribute for ans in payload.answers}
+    used_tags  = {ans.value for ans in payload.answers if ans.attribute == "tags"}
 
     best_diff = float("inf")
     best_question: dict | None = None
@@ -449,7 +824,7 @@ def run_akinator(request: AkinatorRequest):
     # 候補 D: artist_name  ─ 終盤用（候補が特定アーティストに集中したとき）
     # ------------------------------------------------------------------
     if "artist_name" not in used_attrs:
-        used_artists = [a.value for a in request.answers if a.attribute == "artist_name"]
+        used_artists = [a.value for a in payload.answers if a.attribute == "artist_name"]
         ex_params = list(params)
         exclude_sql = ""
         if used_artists:
@@ -502,14 +877,31 @@ def run_akinator(request: AkinatorRequest):
 # ---------------------------------------------------------------------------
 @app.get("/concierge", summary="コンシェルジュ（段階的絞り込みガイド）")
 def concierge(
-    q:       Optional[str] = Query(None, description="キーワード検索"),
+    request: Request,
+    q:       Optional[str] = Query(None, max_length=MAX_Q_LENGTH, description="キーワード検索"),
     tag:     Optional[str] = Query(None, description="セマンティックタグ（FTS5 MATCH）"),
     fame:    Optional[str] = Query(None, description="知名度 (standard | hidden | manic)"),
     mood:    Optional[str] = Query(None, description="感情スコアキー"),
     bpm_min: Optional[int] = Query(None, description="最小BPM"),
     bpm_max: Optional[int] = Query(None, description="最大BPM"),
-    step:    int           = Query(1, description="現在の質問ステップ数"),
+    step:    int           = Query(1, ge=1, description="現在の質問ステップ数"),
 ):
+    request_id = getattr(request.state, "request_id", "req_unknown")
+    if _con is None:
+        return _error_response(
+            status_code=500,
+            code="INTERNAL_ERROR",
+            message="Database connection is not ready.",
+            request_id=request_id,
+        )
+    if bpm_min is not None and bpm_max is not None and bpm_min > bpm_max:
+        return _validation_error_response(
+            request_id=request_id,
+            source="query",
+            field="bpm_min",
+            reason="must be less than or equal to bpm_max",
+            status_code=422,
+        )
     join_clauses: list[str] = []
     where_clauses: list[str] = []
     params: list[Any] = []
@@ -674,14 +1066,27 @@ def concierge(
 # /health エンドポイント
 # ---------------------------------------------------------------------------
 @app.get("/health", summary="ヘルスチェック", include_in_schema=False)
-def health():
-    cur = _con.cursor()
-    cur.execute("SELECT COUNT(*) AS cnt FROM view_active_originals")
-    cnt = cur.fetchone()["cnt"]
+def health(request: Request):
+    request_id = getattr(request.state, "request_id", "req_unknown")
+    if _con is None:
+        return _error_response(
+            status_code=500,
+            code="INTERNAL_ERROR",
+            message="Database connection is not ready.",
+            request_id=request_id,
+        )
+    db_state = "ok"
+    try:
+        cur = _con.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+    except Exception:
+        db_state = "ng"
     return {
         "status": "ok",
-        "db": DB_PATH,
-        "active_tracks": cnt,
-        "thresholds_loaded": len(THRESHOLDS),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checks": {
+            "db": db_state,
+        },
     }
  
