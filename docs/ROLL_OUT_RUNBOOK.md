@@ -99,3 +99,14 @@ Security rollout degradation - YYYY-MM-DD HH:mm JST
 [Next Update ETA]
 - HH:mm JST
 ```
+
+## 7. 演習証跡の保存ルール
+- 保存先（絶対パス）:
+  - `C:\dev\hp-navigator-api\docs\evidence\`
+- ファイル命名:
+  - `RUNBOOK_DRILL_YYYY-MM-DD.md`
+- 必須メタ情報:
+  - Ticket ID
+  - Minutes ID
+  - 実施日時（JST）
+  - 実施者（氏名）

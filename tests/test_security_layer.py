@@ -128,6 +128,17 @@ class SecurityLayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["error"]["code"], "UNAUTHORIZED")
         self.assertIn("request_id", payload["error"])
 
+    async def test_missing_key_and_disallowed_ip_returns_401_first(self):
+        status, _, body = await _asgi_call(
+            self.app,
+            method="GET",
+            path="/search",
+            client=("192.168.1.10", 50000),
+        )
+        self.assertEqual(status, 401)
+        payload = self.main.json.loads(body.decode("utf-8"))
+        self.assertEqual(payload["error"]["code"], "UNAUTHORIZED")
+
     async def test_invalid_xff_returns_400(self):
         status, _, body = await _asgi_call(
             self.app,
@@ -143,6 +154,21 @@ class SecurityLayerTests(unittest.IsolatedAsyncioTestCase):
         payload = self.main.json.loads(body.decode("utf-8"))
         self.assertEqual(payload["error"]["code"], "VALIDATION_ERROR")
         self.assertEqual(payload["error"]["details"]["source"], "header")
+
+    async def test_untrusted_remote_ignores_invalid_xff(self):
+        status, _, body = await _asgi_call(
+            self.app,
+            method="GET",
+            path="/search",
+            headers={
+                "X-API-Key": "test-key",
+                "X-Forwarded-For": "invalid-ip-value",
+            },
+            client=("127.0.0.1", 50000),
+        )
+        self.assertEqual(status, 200)
+        payload = self.main.json.loads(body.decode("utf-8"))
+        self.assertIsInstance(payload, list)
 
     async def test_validation_error_422_schema(self):
         status, _, body = await _asgi_call(
@@ -192,4 +218,3 @@ class FailClosedConfigTests(unittest.IsolatedAsyncioTestCase):
         cm = main_mod.app.router.lifespan_context(main_mod.app)
         with self.assertRaises(RuntimeError):
             await cm.__aenter__()
-
