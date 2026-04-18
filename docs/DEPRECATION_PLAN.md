@@ -29,8 +29,32 @@
 - `/health` は `status` と `checks.db` のみ参照
 - 契約正本:
   - `C:\dev\hp-navigator-api\docs\API_CONTRACT.md`
+  - `C:\dev\hp-navigator-api\docs\SECURITY_IMPLEMENTATION_SPEC.md`
+
+## 5.1 `/health` 先行是正（即時）
+- 先行是正PRスコープ:
+  - `/health` 返却最小化（`status`, `timestamp`, `checks.db`）
+  - `/health` 専用IP制御（`HP_HEALTH_ALLOWED_IPS`）
+- 外部経路遮断:
+  - Ingress/Proxy 側で `/health` を内部ネットワークのみに制限
+  - アプリ側で `HP_HEALTH_ALLOWED_IPS` 判定を併用
+- 反映順序:
+  - `staging` -> `prod`
+- 検証:
+  - 許可IPから 200
+  - 非許可IPから 403
+  - `db` 等の内部情報が非返却
+- 失敗時切戻し条件:
+  - 許可IPで 200 が返らない
+  - 非許可IPで 403 が返らない
+  - 非返却項目に `db` 等が含まれる
+- 運用手順の正本:
+  - `C:\dev\hp-navigator-api\docs\ROLL_OUT_RUNBOOK.md`
+  - `C:\dev\hp-navigator-api\docs\GO_LIFT_EVIDENCE_CHECKLIST.md`
 
 ## 6. 切替当日Runbook（時刻入り）
+※ 詳細手順・担当ロールは `C:\dev\hp-navigator-api\docs\ROLL_OUT_RUNBOOK.md` を正本とする。
+
 ### 6.1 事前（JST）
 1. 09:00: 変更凍結開始、関係者へ最終告知
 2. 09:30: `HP_SECURITY_ALLOWED_IPS` / `HP_SECURITY_TRUSTED_PROXY_CIDRS` 確認

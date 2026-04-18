@@ -60,9 +60,12 @@
   - `HP_SECURITY_TRUSTED_PROXY_CIDRS`
   - `HP_HEALTH_ALLOWED_IPS`
 - 環境差分方針:
-  - local: `HP_SECURITY_TRUSTED_PROXY_CIDRS` は未設定可（推定: プロキシなし運用）
+  - local: `HP_SECURITY_TRUSTED_PROXY_CIDRS` は未設定とする（ローカルは reverse proxy 非経由を標準運用）
   - staging/prod: `HP_SECURITY_TRUSTED_PROXY_CIDRS` 必須
   - prod では private CIDR の網羅確認をリリースゲート化
+- 実装詳細の正本:
+  - `C:\dev\hp-navigator-api\docs\SECURITY_IMPLEMENTATION_SPEC.md`
+  - 固定順序: `X-API-Key検証 -> Client IP確定 -> Allowlist判定`
 
 ### 5.3 APIキー運用（追加改善）
 - ローテーション周期: 90日
@@ -82,6 +85,32 @@
 - OpenAPIに含めない（`include_in_schema=False` 維持）。
 - 返却項目は最小化し、内部パスを返さない。
 - 許可IPは `HP_HEALTH_ALLOWED_IPS` を使用。
+
+### 6.1 `/health` 先行是正計画（High Blocker対応）
+- 目的:
+  - 既存 `db` パス露出を最短で解消する。
+  - 根拠: `C:\dev\hp-navigator-api\main.py:683`
+- 手順:
+  1. レスポンスを最小セットへ縮退（`status`, `timestamp`, `checks.db`）
+  2. `/health` を `HP_HEALTH_ALLOWED_IPS` で到達制御
+  3. 非許可経路は `403` を返却
+  4. 非返却項目（`db`, 接続文字列, 内部設定値）を契約固定
+- 先行リリース可否:
+  - 可（`/health` は OpenAPI非掲載・内部用途のため独立先行対象）
+  - `feature flag` は不採用（方針固定）。理由: 経路制御と契約縮退のみのため構成複雑化を避ける。
+- 反映順序:
+  - `staging` で 24時間観測後、`prod` に反映
+- 外部経路遮断の運用:
+  - WAF/Ingress/Proxy で `/health` を内部ネットワークに限定
+  - API層でも `HP_HEALTH_ALLOWED_IPS` で二重防御
+- 検証項目:
+  - 内部許可IP: 200
+  - 非許可IP: 403
+  - レスポンスに `db` 等が存在しない
+- 失敗時切戻し条件:
+  - staging/prod で `/health` 許可IPが 200 を返せない
+  - 非許可IPで 403 が出ない
+  - レスポンスに `db` または内部設定値が含まれる
 
 ## 7. 終了条件・業務ルール固定
 - `/akinator`:
@@ -150,13 +179,51 @@
   - error schema
 
 ## 12. 実装ステップ（時系列）
-1. 契約固定（API_CONTRACT + OpenAPI）
-2. セキュリティ実装（API Key + Allowlist + IP判定規則）
-3. `/health` 再定義（内部専用・最小返却）
-4. 層分離（API/Service/DB）
-5. テスト実装（unit + integration）
-6. 単線切替（旧仕様停止）
-7. 運用告知・監視確認
+1. セキュリティ仕様固定（`SECURITY_IMPLEMENTATION_SPEC.md`）
+2. `/health` 先行是正（内部専用・最小返却）
+3. 契約固定（API_CONTRACT + OpenAPI）
+4. セキュリティ実装（API Key + Allowlist + IP判定規則）
+5. 層分離（API/Service/DB）
+6. テスト実装（unit + integration）
+7. 単線切替（旧仕様停止）
+8. 運用告知・監視確認
+
+### 12.1 セキュリティ層 PR分割計画（固定）
+- PR1: `request_id` + 共通エラーハンドラ
+  - DoD:
+    - 全レスポンスで `X-Request-Id` を返却
+    - 400/401/403/422/500 が共通エラースキーマ準拠
+    - `API_CONTRACT.md` と `TEST_PLAN.md` の契約テスト追加済み
+- PR2: API Key 検証
+  - DoD:
+    - `X-API-Key` 欠落/不正で 401
+    - 正常キーで後続判定へ進む
+    - 監査ログに `auth_result` と `api_key_id(masked)` を出力
+- PR3: trusted proxy 判定 + Allowlist
+  - DoD:
+    - `remote_addr` / `X-Forwarded-For` 解決が `SECURITY_IMPLEMENTATION_SPEC.md` 準拠
+    - Allowlist 非許可で 403
+    - 無効CIDR設定で fail-closed（起動失敗）
+- PR4: 全エンドポイント適用 + 契約テスト
+  - DoD:
+    - `/search`, `/akinator`, `/concierge`, `/health` すべてで共通セキュリティ層有効
+    - `/health` 先行是正チェック（内部200/外部403/非返却）合格
+    - `GO_LIFT_EVIDENCE_CHECKLIST.md` の必須証跡を全添付
+
+### 12.2 リリースゲート（数値固定）
+- 判定指標:
+  - auth failure rate（401+403） <= 5.0%
+  - 5xx rate < 1.0%（No-Go: >= 2.0% が連続5分）
+  - p95 latency:
+    - `/search`, `/concierge` <= 300ms
+    - `/akinator` <= 500ms
+- 責任者:
+  - 判定責任: Incident Commander (IC)
+  - 技術承認: API Owner
+  - セキュリティ承認: Security Owner
+- 証跡正本:
+  - `C:\dev\hp-navigator-api\docs\ROLL_OUT_RUNBOOK.md`
+  - `C:\dev\hp-navigator-api\docs\GO_LIFT_EVIDENCE_CHECKLIST.md`
 
 ## 13. リスクと対策
 - 外部設定（Custom GPT Actions）未回収

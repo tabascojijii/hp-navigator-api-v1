@@ -14,6 +14,10 @@
   - `403 Forbidden`
   - `422 Unprocessable Entity`
   - `500 Internal Server Error`
+- 認証判定順序（固定）:
+  1. `X-API-Key` 検証（失敗時 401）
+  2. Client IP確定（trusted proxy 条件付き XFF 解決）
+  3. Allowlist判定（失敗時 403）
 - 根拠実装（現状エンドポイント）:
   - `C:\dev\hp-navigator-api\main.py:238`
   - `C:\dev\hp-navigator-api\main.py:331`
@@ -54,7 +58,14 @@
 - `VALIDATION_ERROR` のステータス境界:
   - `400`: HTTPヘッダ/メタ情報の不正（例: 不正 `X-Forwarded-For`）
   - `422`: リクエストボディ/クエリの型・スキーマ不正
-  - どちらも `error.code=VALIDATION_ERROR` を利用し、`details.source` で区別（`header` or `body`）
+  - どちらも `error.code=VALIDATION_ERROR` を利用し、`details.source` で区別（`header | query | body`）
+
+### 3.0 ステータス境界表（固定）
+| Status | 典型原因 | `error.code` | `details.source` |
+|---|---|---|---|
+| 400 | ヘッダ/メタ情報不正（不正XFFなど） | `VALIDATION_ERROR` | `header` |
+| 422 | query の型/スキーマ不正 | `VALIDATION_ERROR` | `query` |
+| 422 | body の型/スキーマ不正 | `VALIDATION_ERROR` | `body` |
 
 ### 3.1 400例
 ```json
